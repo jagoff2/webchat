@@ -4,7 +4,7 @@ Persistent chats, Markdown UI, citation chips styling, multi‑chat sidebar.
 
 All original features are kept; the citation / markdown rendering code has been
 replaced with the more robust version from the “CITATION + RENDER HELPERS”
-paste.
+paste.  Additionally, model thoughts are now displayed inside a [thinking] block.
 """
 
 from __future__ import annotations
@@ -39,18 +39,12 @@ from flask import ( Flask, abort, g, jsonify, render_template_string,
 # ----------------------------------------------------------------------
 class Config:
     """Centralised Flask configuration."""
-    # Paths
     DB_PATH: Path = Path(os.getenv("CHAT_DB_PATH", "chat_store.sqlite3"))
-    # Secrets
     SECRET_KEY: str = os.getenv("FLASK_SECRET_KEY", uuid.uuid4().hex)
-    # Limits
     MAX_CONTENT_LENGTH: int = 16 * 1024 * 1024          # 16 MiB upload limit
     RATE_LIMIT: int = 5                               # requests per minute per IP
-    # LLaMA server endpoint
     LLAMA_ENDPOINT: str = "http://127.0.0.1:8000/v1/chat/completions"
-    # HTTP session for external calls (re‑use TCP connections)
     HTTP_TIMEOUT: int = 60
-    # Logging
     LOG_LEVEL = logging.INFO
 
 # ----------------------------------------------------------------------
@@ -301,16 +295,48 @@ def _latest_web_search(chat_id: str) -> List[Dict[str, Any]]:
 # Current‑chat handling (stored in Flask session)
 # ----------------------------------------------------------------------
 def _get_or_create_current_chat() -> str:
-    sid = _get_sid()
+    """
+    Return the chat ID that should be used for the current request.
+
+    * If the user already has a ``current_chat_id`` stored in the Flask
+      session, that ID is returned (and we make sure the chat still exists).
+    * If the session does not yet know which chat is active, we look for any
+      existing chats that belong to the same ``sid`` and pick the most recent
+      one.
+    * If no chats exist for this ``sid`` we create a brand‑new chat,
+      insert the immutable system prompt, store the ID in the session and
+      return it.
+    """
+    sid = _get_sid()                     # <-- correct variable name
     _ensure_session_row(sid)
-    if "current_chat_id" not in session:
-        existing = _list_chats(sid)
-        if existing:
-            session["current_chat_id"] = existing[0]["id"]
-        else:
-            session["current_chat_id"] = _create_chat(sid, "Chat 1")
-            _insert_message(session["current_chat_id"], "system", SYSTEM_PROMPT)
-    return session["current_chat_id"]
+
+    # ------------------------------------------------------------------
+    # 1️⃣  Already have a chat ID in the session?
+    # ------------------------------------------------------------------
+    if "current_chat_id" in session:
+        # make sure the chat still exists (it could have been deleted)
+        cur = get_db().execute(
+            "SELECT 1 FROM chats WHERE id=? AND sid=?", (session["current_chat_id"], sid)
+        )
+        if cur.fetchone():
+            return session["current_chat_id"]
+        # fall‑through if the stored ID is stale
+
+    # ------------------------------------------------------------------
+    # 2️⃣  Re‑use an existing chat for this user (most‑recently updated)
+    # ------------------------------------------------------------------
+    existing = _list_chats(sid)
+    if existing:
+        session["current_chat_id"] = existing[0]["id"]
+        return session["current_chat_id"]
+
+    # ------------------------------------------------------------------
+    # 3️⃣  No chat yet → create a fresh one and seed it with the system prompt
+    # ------------------------------------------------------------------
+    new_id = _create_chat(sid, "Chat 1")
+    _insert_message(new_id, "system", SYSTEM_PROMPT)
+    session["current_chat_id"] = new_id
+    return new_id
 
 def _switch_chat(chat_id: str) -> bool:
     sid = _get_sid()
@@ -551,7 +577,7 @@ def _call_llama(messages: List[Dict[str, Any]], *, tools: Optional[List[Dict[str
         payload["tool_choice"] = tool_choice
 
     app.logger.debug("→ LLaMA payload: %s", json.dumps(payload, ensure_ascii=False)[:800])
-    resp = _http.post(Config.LLAMA_ENDPOINT, json=payload, timeout=300)
+    resp = _http.post(Config.LLAMA_ENDPOINT, json=payload, timeout=30000)
     resp.raise_for_status()
     result = resp.json()
     app.logger.debug("← LLaMA response: %s", json.dumps(result, ensure_ascii=False)[:800])
@@ -571,12 +597,21 @@ def _run_until_answer(chat_id: str) -> Tuple[str, bool]:
 
         # ----------------------- TOOL CALLS -----------------------
         if message.get("tool_calls"):
+            # ----- 1️⃣  Store the model's *thoughts* (if any) inside a [thinking] block -----
+            raw_thoughts = (message.get("content") or "").strip()
+            if raw_thoughts:
+                thinking_block = f"[thinking]{raw_thoughts}[/thinking]"
+                _insert_message(chat_id, "assistant", thinking_block)
+
+            # ----- 2️⃣  Store the tool‑call skeleton (so the model can reference it) -----
             _insert_message(
                 chat_id,
                 "assistant",
-                message.get("content") or "",
+                "",                     # no visible content; the thoughts are already stored
                 api_extra={"tool_calls": message["tool_calls"]},
             )
+
+            # ----- 3️⃣  Execute each tool call -----
             for tc in message["tool_calls"]:
                 fn = tc["function"]["name"]
                 args = json.loads(tc["function"].get("arguments") or "{}")
@@ -801,7 +836,7 @@ def internal_error(err) -> Response:
     return jsonify({"error": "Internal server error"}), 500
 
 # ----------------------------------------------------------------------
-# UI template (includes the *new* citation / markdown helpers)
+# UI template (includes the *new* citation / markdown helpers + thinking block)
 # ----------------------------------------------------------------------
 HTML_TEMPLATE = r"""
 <!doctype html>
@@ -834,6 +869,16 @@ HTML_TEMPLATE = r"""
     .chat-item:hover{background:#f8f9fa;}
     .chat-item.active{background:#e7f1ff;border:1px solid #cfe2ff;}
     .chat-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:170px;}
+    /* ---------- thinking block styling ---------- */
+    .thinking-block{
+        background:#e0f7fa;
+        border-left:4px solid #00796b;
+        padding:.6rem 1rem;
+        margin:.5rem 0;
+        font-style:italic;
+        color:#004d40;
+        border-radius:.4rem;
+    }
   </style>
 </head>
 <body>
@@ -972,12 +1017,6 @@ function makeCiteChip(n, url){
 }
 
 /* --- Replace bracket markers in innerHTML with placeholders --- */
-/* Supported forms:
-    -> lastSearchResults[2]
-   【https://...】 -> that URL
-   【{"id":0}】 or {"index":2} -> map by index into lastSearchResults
-   【token】 -> substring match against known sources; fallback latestToolUrl
-*/
 function convertBracketCitations(root, known){
   function urlFromIndex(idx){
     const i = Math.max(0, Number(idx)||0);
@@ -1145,6 +1184,17 @@ function renderMarkdown(el){
   if(!el.innerHTML.trim()) el.innerHTML = '&ThinSpace;';
 }
 
+/* --- Thinking‑block post‑processor ----------------------------------- */
+function replaceThinkingBlocks(root){
+  // Look for the literal “[thinking]…[/thinking]” markers (may be inside <p>)
+  const html = root.innerHTML;
+  const replaced = html.replace(/\[thinking\]([\s\S]*?)\[\/thinking\]/gi, (m, inner) => {
+    const clean = inner.trim();
+    return `<div class="thinking-block">${clean}</div>`;
+  });
+  if (replaced !== html) root.innerHTML = replaced;
+}
+
 /* -------------------------- UI helpers -------------------------- */
 let latestToolUrl = '';
 let lastSearchResults = {{ (last_web_results or []) | tojson }};
@@ -1168,6 +1218,8 @@ function appendMessage(role, raw, banner=null){
   content.className = 'msg-content render-md';
   content.dataset.raw = raw||'';
   renderMarkdown(content);
+  // after rendering, replace any thinking markers with styled blocks
+  replaceThinkingBlocks(content);
   div.appendChild(content);
 
   if(banner){
@@ -1295,7 +1347,10 @@ renderAll();
 updateSidebar();
 
 function renderAll(){
-  document.querySelectorAll('.render-md').forEach(renderMarkdown);
+  document.querySelectorAll('.render-md').forEach(el=>{
+    renderMarkdown(el);
+    replaceThinkingBlocks(el);
+  });
   chatBox.scrollTop = chatBox.scrollHeight;
 }
 </script>

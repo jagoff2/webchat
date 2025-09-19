@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 """
 Flask UI + LLaMA (llama-server) + DuckDuckGo + http_get
 Persistent chats, Markdown UI, citation chips styling, multi‑chat sidebar.
@@ -654,7 +654,7 @@ def index() -> Response:
     chat_id = session["current_chat_id"]
     msgs = _get_messages(chat_id)
 
-    # Build display history for the UI (user & assistant as‐is, tool as fenced block)
+    # Build display history for the UI (user & assistant as‑is, tool as fenced block)
     display: List[Dict[str, Any]] = []
     for m in msgs:
         if m["role"] in ("user", "assistant"):
@@ -817,7 +817,7 @@ def internal_error(err) -> Response:
     return jsonify({"error": "Internal server error"}), 500
 
 # ----------------------------------------------------------------------
-# UI template (unchanged except minor styling tweaks)
+# UI template (unchanged except minor styling tweaks + JS fixes)
 # ----------------------------------------------------------------------
 HTML_TEMPLATE = r"""
 <!doctype html>
@@ -841,12 +841,11 @@ HTML_TEMPLATE = r"""
     .msg-assistant .msg-content {background:#e9ecef;color:#212529;}
     .msg-tool .msg-content {background:#fff;color:#212529;border:1px dashed #adb5bd;}
     .typing .msg-content {font-style:italic;color:#666;}
-    .tool-banner {font-size:.85rem;color:#555;margin:.2rem 0;}
     pre {background:#f1f3f5;padding:.8rem;border-radius:.4rem;overflow:auto;}
     code {font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;}
     .cite {vertical-align:super;font-size:.75em;margin-left:.15rem;}
     .cite-link {text-decoration:none;border-bottom:1px dotted rgba(13,110,253,.5);opacity:.75;padding:0 .15rem;}
-    .cite-link:hover,.cite-link:focus {opacity:1;border-bottom-color:rgba(13,110,253,.9);}
+    .cite-link:hover,.cite-link:focus {opacity:1;border-bottom-color:rgba(13,110,253,.9);} 
     .chat-item{display:flex;align-items:center;justify-content:space-between;padding:.4rem .5rem;border-radius:.5rem;cursor:pointer;}
     .chat-item:hover{background:#f8f9fa;}
     .chat-item.active{background:#e7f1ff;border:1px solid #cfe2ff;}
@@ -933,7 +932,7 @@ function initTooltips(root) {
 }
 const sanitizeCfg = {ADD_ATTR:['data-bs-toggle','data-bs-title','target','rel']};
 
-/* ---------- Citation helpers ---------- */
+/* ---------- Citation helpers (pretty [1] chips) ---------- */
 function unwrapDDG(url){
   try{
     const u = new URL(url);
@@ -965,7 +964,7 @@ function replacePlainBracketUrl(html){
     let match='';
     for(const r of lastSearchResults) if(r.url && r.url.toLowerCase().includes(token.toLowerCase())){ match=r.url; break; }
     if(!match) match = latestToolUrl || resultUrl(0);
-    cnt+=1; return makeCiteHTML(cnt, match);
+    const n = ++cnt; return makeCiteHTML(n, match);
   });
   return html;
 }
@@ -993,18 +992,49 @@ function replaceSourceAnchors(root){
     a.replaceWith(span.firstChild);
   });
 }
+function renumberCitationsUnique(root){
+  const links = Array.from(root.querySelectorAll('a.cite-link'));
+  const map = new Map();
+  let n = 0;
+  links.forEach(a=>{
+    const href = a.getAttribute('href')||'';
+    const key = unwrapDDG(href);
+    if(!map.has(key)) map.set(key, ++n);
+    a.textContent = `[${map.get(key)}]`;
+    a.setAttribute('data-bs-title', key);
+  });
+}
 function prettifyCitations(el){
   let html = replaceBracketJSON(replaceBracketDagger(el.innerHTML));
   html = replacePlainBracketUrl(html);
   el.innerHTML = html;
   replaceSourceAnchors(el);
+  renumberCitationsUnique(el);
+}
+
+/* ---------- Robust Markdown render (fixes empty bubbles on chat switch) ---------- */
+function decodeRaw(raw){
+  if(raw==null) return '';
+  // If Jinja placed a JSON string into data-raw, parse it to a real string
+  try{
+    const first = String(raw).trim()[0];
+    if(first === '"' || first === '{' || first === '['){
+      const parsed = JSON.parse(raw);
+      if(typeof parsed === 'string') return parsed;
+    }
+  }catch{}
+  // Fallback: convert escaped newlines to actual newlines
+  return String(raw).replace(/\\n/g,'\n');
 }
 function renderMarkdown(el){
-  const raw = el.dataset.raw ?? el.innerText ?? '';
-  const html = marked.parse(raw);
+  const rawAttr = (el.dataset && 'raw' in el.dataset) ? el.dataset.raw : el.innerText;
+  const raw = decodeRaw(rawAttr);
+  const html = marked.parse(raw || '');
   el.innerHTML = DOMPurify.sanitize(html, sanitizeCfg);
   prettifyCitations(el);
   initTooltips(el);
+  // If still empty, show a thin space to keep bubble height sensible
+  if(!el.innerHTML.trim()) el.innerHTML = '&ThinSpace;';
 }
 function renderAll(){
   document.querySelectorAll('.render-md').forEach(renderMarkdown);
@@ -1016,7 +1046,7 @@ function appendMessage(role, raw, banner=null){
   div.className = `msg ${roleCls}`;
 
   const content = document.createElement('div');
-  content.className = 'msg-content';
+  content.className = 'msg-content render-md';
   content.dataset.raw = raw||'';
   renderMarkdown(content);
   div.appendChild(content);
@@ -1049,6 +1079,7 @@ userInput.addEventListener('keydown', e=>{
     document.getElementById('chat-form').requestSubmit();
   }
 });
+
 document.getElementById('chat-form').addEventListener('submit', async e=>{
   e.preventDefault();
   const txt = userInput.value.trim();

@@ -1,9 +1,10 @@
-
 """
 Flask UI + LLaMA (llama-server) + DuckDuckGo + http_get
 Persistent chats, Markdown UI, citation chips styling, multi‑chat sidebar.
 
-All original features are kept; the code has been refactored and hardened.
+All original features are kept; the citation / markdown rendering code has been
+replaced with the more robust version from the “CITATION + RENDER HELPERS”
+paste.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ import requests
 from bs4 import BeautifulSoup
 from flask import ( Flask, abort, g, jsonify, render_template_string,
                     request, session, url_for, Response )
+
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
@@ -84,7 +86,6 @@ def _rate_limited() -> bool:
 # ----------------------------------------------------------------------
 # Content‑Security‑Policy header (added to every response)
 # ----------------------------------------------------------------------
-@app.after_request
 @app.after_request
 def add_security_headers(resp: Response) -> Response:
     resp.headers["Content-Security-Policy"] = (
@@ -325,7 +326,6 @@ def _get_sid() -> str:
 # ----------------------------------------------------------------------
 # Tools (DuckDuckGo search + HTTP GET)
 # ----------------------------------------------------------------------
-# Re‑use one `requests.Session` with retry logic for all external calls
 _http = requests.Session()
 _adapter = requests.adapters.HTTPAdapter(max_retries=3)
 _http.mount("http://", _adapter)
@@ -345,7 +345,6 @@ def duckduckgo_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
         data = r.json()
         results: List[Dict[str, str]] = []
         for item in data.get("RelatedTopics", []):
-            # Some entries have nested "Topics"
             for sub in item.get("Topics", [item]):
                 if "Text" in sub and "FirstURL" in sub:
                     results.append(
@@ -362,7 +361,7 @@ def duckduckgo_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
     except Exception as exc:
         app.logger.debug("DuckDuckGo JSON API error: %s", exc)
 
-    # Fallback to HTML scrape if the API fails
+    # Fallback to HTML scrape
     fallback_url = "https://html.duckduckgo.com/html/"
     try:
         r = _http.get(
@@ -491,16 +490,11 @@ WINDOW_TOOL_PAIRS = 6      # last N tool call/result pairs
 MAX_TOOL_STEPS = 64        # safety guard
 
 def _build_windowed_messages(full: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Trim the full history to a manageable window that still contains the
-    latest system message, recent user/assistant turns and recent tool
-    interactions.
-    """
-    # Keep the most recent system message only
+    """Trim the full history to a manageable window."""
     system = [m for m in full if m["role"] == "system"]
     others = [m for m in full if m["role"] != "system"]
 
-    result: List[Dict[str, Any]] = system[-1:]  # latest system only
+    result: List[Dict[str, Any]] = system[-1:]          # latest system only
     compact: List[Dict[str, Any]] = []
     tool_kept = 0
     ua_kept = 0
@@ -544,10 +538,7 @@ def _build_windowed_messages(full: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
 def _call_llama(messages: List[Dict[str, Any]], *, tools: Optional[List[Dict[str, Any]]] = None,
                 tool_choice: str = "auto") -> Dict[str, Any]:
-    """
-    Send a request to the local LLaMA server. Retries are handled by the
-    underlying ``requests.Session``.
-    """
+    """Send a request to the local LLaMA server."""
     payload: Dict[str, Any] = {
         "model": "local-llama",
         "messages": messages,
@@ -560,17 +551,14 @@ def _call_llama(messages: List[Dict[str, Any]], *, tools: Optional[List[Dict[str
         payload["tool_choice"] = tool_choice
 
     app.logger.debug("→ LLaMA payload: %s", json.dumps(payload, ensure_ascii=False)[:800])
-    resp = _http.post(Config.LLAMA_ENDPOINT, json=payload, timeout=300)  # generous timeout
+    resp = _http.post(Config.LLAMA_ENDPOINT, json=payload, timeout=300)
     resp.raise_for_status()
     result = resp.json()
     app.logger.debug("← LLaMA response: %s", json.dumps(result, ensure_ascii=False)[:800])
     return result
 
 def _run_until_answer(chat_id: str) -> Tuple[str, bool]:
-    """
-    Execute the model/orchestrator loop until a final assistant message is produced.
-    Returns (assistant_text, tool_was_used).
-    """
+    """Execute the model/orchestrator loop until a final assistant message is produced."""
     steps = 0
     full = _get_messages(chat_id)
 
@@ -638,7 +626,6 @@ def _run_until_answer(chat_id: str) -> Tuple[str, bool]:
         # -------------------- FINAL ANSWER --------------------
         answer = (message.get("content") or "").strip()
         _insert_message(chat_id, "assistant", answer)
-        # Was any tool used in this round?
         tool_used = any(m["role"] == "tool" for m in full)
         return answer, tool_used
 
@@ -654,7 +641,7 @@ def index() -> Response:
     chat_id = session["current_chat_id"]
     msgs = _get_messages(chat_id)
 
-    # Build display history for the UI (user & assistant as‑is, tool as fenced block)
+    # Build display history (user/assistant as‑is, tool as fenced block)
     display: List[Dict[str, Any]] = []
     for m in msgs:
         if m["role"] in ("user", "assistant"):
@@ -688,7 +675,7 @@ def chat_endpoint() -> Response:
 
     try:
         chat_id = _get_or_create_current_chat()
-        # guarantee a system message exists at the top of the chat
+        # Ensure a system message exists
         msgs = _get_messages(chat_id)
         if not msgs or msgs[0]["role"] != "system":
             _insert_message(chat_id, "system", SYSTEM_PROMPT)
@@ -715,10 +702,7 @@ def upload() -> Response:
     if f.filename == "":
         return jsonify({"success": False, "error": "No selected file"}), 400
 
-    # Basic sanitisation – strip path components and limit length
-    filename = os.path.basename(f.filename)
-    filename = filename[:255]  # filesystem safe limit
-
+    filename = os.path.basename(f.filename)[:255]  # filesystem‑safe limit
     try:
         content = f.read().decode(errors="replace")
         _add_upload(_get_sid(), filename, content)
@@ -817,7 +801,7 @@ def internal_error(err) -> Response:
     return jsonify({"error": "Internal server error"}), 500
 
 # ----------------------------------------------------------------------
-# UI template (unchanged except minor styling tweaks + JS fixes)
+# UI template (includes the *new* citation / markdown helpers)
 # ----------------------------------------------------------------------
 HTML_TEMPLATE = r"""
 <!doctype html>
@@ -919,20 +903,11 @@ HTML_TEMPLATE = r"""
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <script>
-let latestToolUrl = '';
-let lastSearchResults = {{ (last_web_results or []) | tojson }};
+/* =========================
+   CITATION + RENDER HELPERS
+   ========================= */
 
-const chatBox = document.getElementById('chat');
-const chatList = document.getElementById('chat-list');
-const currentTitleEl = document.getElementById('current-chat-title');
-
-function initTooltips(root) {
-  const els = root.querySelectorAll('[data-bs-toggle="tooltip"]');
-  els.forEach(el => new bootstrap.Tooltip(el));
-}
-const sanitizeCfg = {ADD_ATTR:['data-bs-toggle','data-bs-title','target','rel']};
-
-/* ---------- Citation helpers (pretty [1] chips) ---------- */
+/* --- URL utilities --- */
 function unwrapDDG(url){
   try{
     const u = new URL(url);
@@ -940,106 +915,250 @@ function unwrapDDG(url){
       const real = u.searchParams.get('uddg');
       if (real) return decodeURIComponent(real);
     }
-    return url;
-  }catch{return url;}
+  }catch{}
+  return url;
 }
-function makeCiteHTML(n,url){
-  const clean = unwrapDDG(url||'');
-  const tip = clean||'Source';
-  return `<small><sup class="cite"><a class="cite-link" href="${clean}" target="_blank" rel="noopener" data-bs-toggle="tooltip" data-bs-title="${tip}">[${n}]</a></sup></small>`;
+function isHttpUrl(s){
+  try{ const u=new URL(s); return u.protocol==='http:'||u.protocol==='https:'; }catch{ return false; }
 }
-function resultUrl(idx){ return (lastSearchResults[idx]||{}).url||''; }
-function replaceBracketDagger(html){
-  return html.replace(/【\s*(\d+)\s*†[^】]*】/g,(_,num)=>{
-    const i = Math.max(0,parseInt(num,10)-1);
-    return makeCiteHTML(i+1, resultUrl(i));
-  });
-}
-function replacePlainBracketUrl(html){
-  let cnt = lastSearchResults.length;
-  html = html.replace(/【\s*(https?:\/\/[^】\s]+)\s*】/g,(m,url)=>{
-    cnt+=1; return makeCiteHTML(cnt,url);
-  });
-  html = html.replace(/【\s*([^\s\}]+)\s*】/g,(m,token)=>{
-    let match='';
-    for(const r of lastSearchResults) if(r.url && r.url.toLowerCase().includes(token.toLowerCase())){ match=r.url; break; }
-    if(!match) match = latestToolUrl || resultUrl(0);
-    const n = ++cnt; return makeCiteHTML(n, match);
-  });
-  return html;
-}
-function replaceBracketJSON(html){
-  return html.replace(/【\s*(\{[^】]*\})\s*】/g,(_,jsonStr)=>{
-    try{
-      const obj = JSON.parse(jsonStr);
-      const idx = obj.id||obj.index||obj.result||obj.i||0;
-      const i = Math.max(0,idx);
-      return makeCiteHTML(i+1, resultUrl(i));
-    }catch{ return makeCiteHTML(1,resultUrl(0)); }
-  });
-}
-function replaceSourceAnchors(root){
-  const anchors = root.querySelectorAll('a');
-  anchors.forEach(a=>{
-    const txt = (a.textContent||'').trim();
-    const m = /^source\s+(\d+)$/i.exec(txt);
-    if(!m) return;
-    const n = parseInt(m[1],10);
-    const url = a.getAttribute('href')||resultUrl(n-1);
-    const html = makeCiteHTML(n,url);
-    const span = document.createElement('span');
-    span.innerHTML = html;
-    a.replaceWith(span.firstChild);
-  });
-}
-function renumberCitationsUnique(root){
-  const links = Array.from(root.querySelectorAll('a.cite-link'));
-  const map = new Map();
-  let n = 0;
-  links.forEach(a=>{
-    const href = a.getAttribute('href')||'';
-    const key = unwrapDDG(href);
-    if(!map.has(key)) map.set(key, ++n);
-    a.textContent = `[${map.get(key)}]`;
-    a.setAttribute('data-bs-title', key);
-  });
-}
-function prettifyCitations(el){
-  let html = replaceBracketJSON(replaceBracketDagger(el.innerHTML));
-  html = replacePlainBracketUrl(html);
-  el.innerHTML = html;
-  replaceSourceAnchors(el);
-  renumberCitationsUnique(el);
+function normalizeUrl(u){
+  try{
+    const x = new URL(unwrapDDG(u));
+    x.hash = ''; // drop fragment when numbering
+    return x.toString().replace(/\/+$/,'');
+  }catch{ return u || ''; }
 }
 
-/* ---------- Robust Markdown render (fixes empty bubbles on chat switch) ---------- */
+/* --- Known sources: last web results, latest tool URL, plus anchors found in message --- */
+function collectKnownSources(root){
+  const order = [];
+  const add = (u)=>{
+    const n = normalizeUrl(u);
+    if(!n || !isHttpUrl(n)) return;
+    if(!order.includes(n)) order.push(n);
+  };
+  // 1) From /chat payload (DuckDuckGo search results)
+  if(Array.isArray(lastSearchResults)){
+    for(const r of lastSearchResults){
+      if(r && r.url) add(r.url);
+    }
+  }
+  // 2) From latest tool (http_get) if any
+  if(latestToolUrl) add(latestToolUrl);
+  // 3) Any hrefs already present in the rendered message
+  root.querySelectorAll('a[href]').forEach(a=> add(a.getAttribute('href')));
+  return order;
+}
+
+/* --- Pretty chip --- */
+function makeCiteChip(n, url){
+  const title = normalizeUrl(url) || 'Source';
+  const a = document.createElement('a');
+  a.className = 'cite-link';
+  a.href = url || '#';
+  a.target = '_blank';
+  a.rel = 'noopener';
+  a.setAttribute('data-bs-toggle','tooltip');
+  a.setAttribute('data-bs-title', title);
+  a.textContent = `[${n}]`;
+
+  const sup = document.createElement('sup');
+  sup.className = 'cite';
+  sup.appendChild(a);
+
+  const small = document.createElement('small');
+  small.appendChild(sup);
+  return small;
+}
+
+/* --- Replace bracket markers in innerHTML with placeholders --- */
+/* Supported forms:
+    -> lastSearchResults[2]
+   【https://...】 -> that URL
+   【{"id":0}】 or {"index":2} -> map by index into lastSearchResults
+   【token】 -> substring match against known sources; fallback latestToolUrl
+*/
+function convertBracketCitations(root, known){
+  function urlFromIndex(idx){
+    const i = Math.max(0, Number(idx)||0);
+    const r = (lastSearchResults && lastSearchResults[i]) ? lastSearchResults[i].url : '';
+    return normalizeUrl(r);
+  }
+  function resolveToken(tok){
+    const t = (tok||'').trim();
+    if(!t) return '';
+    // numeric with optional dagger/range
+    const mNum = /^(\d+)(?:\s*†.*)?$/i.exec(t);
+    if(mNum) return urlFromIndex(Number(mNum[1])-1);
+    // JSON object
+    if(t.startsWith('{') && t.endsWith('}')){
+      try{
+        const o = JSON.parse(t);
+        const idx = o.id ?? o.index ?? o.result ?? o.i ?? 0;
+        return urlFromIndex(idx);
+      }catch{/* ignore */}
+    }
+    // direct URL
+    if(isHttpUrl(t)) return normalizeUrl(t);
+    // token match against known sources
+    const needle = t.toLowerCase();
+    for(const k of known){
+      if(k.toLowerCase().includes(needle)) return k;
+    }
+    // fallback
+    return normalizeUrl(latestToolUrl) || '';
+  }
+
+  // Replace all 【 ... 】 with <span data-cite-url="..."></span>
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const targets = [];
+  while(walker.nextNode()){
+    const node = walker.currentNode;
+    if(!node.nodeValue || node.nodeValue.indexOf('【')===-1) continue;
+    targets.push(node);
+  }
+
+  for(const textNode of targets){
+    const frag = document.createDocumentFragment();
+    const re = /【\s*([^】]+?)\s*】/g;
+    let i = 0, m;
+    const s = textNode.nodeValue;
+    while((m = re.exec(s))){
+      const before = s.slice(i, m.index);
+      if(before) frag.appendChild(document.createTextNode(before));
+      const url = resolveToken(m[1]);
+      const span = document.createElement('span');
+      span.setAttribute('data-cite-url', url);
+      frag.appendChild(span);
+      i = m.index + m[0].length;
+    }
+    const after = s.slice(i);
+    if(after) frag.appendChild(document.createTextNode(after));
+    textNode.parentNode.replaceChild(frag, textNode);
+  }
+}
+
+/* --- Collapse inline naked links (and “source N” anchors) to placeholder spans --- */
+function collapseInlineLinksToPlaceholders(root){
+  // "source 2" → placeholder with data-cite-url=<href or keep order>
+  root.querySelectorAll('a[href]').forEach(a=>{
+    const txt = (a.textContent||'').trim();
+    const href = a.getAttribute('href') || '';
+    const isNaked = txt === href || txt === unwrapDDG(href);
+    const isSourceLabel = /^source\s+\d+$/i.test(txt);
+    if(isNaked || isSourceLabel){
+      const span = document.createElement('span');
+      span.setAttribute('data-cite-url', normalizeUrl(href));
+      a.replaceWith(span);
+    }
+  });
+
+  // Also catch raw URL text that markdown didn’t autolink
+  const urlRe = /(https?:\/\/[^\s)]+)(?![^<]*>)/ig;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  while(walker.nextNode()){
+    const n = walker.currentNode;
+    if(n.nodeValue && urlRe.test(n.nodeValue)) nodes.push(n);
+    urlRe.lastIndex = 0;
+  }
+  for(const t of nodes){
+    const s = t.nodeValue;
+    const frag = document.createDocumentFragment();
+    let i=0, m;
+    while((m = urlRe.exec(s))){
+      const before = s.slice(i, m.index);
+      if(before) frag.appendChild(document.createTextNode(before));
+      const span = document.createElement('span');
+      span.setAttribute('data-cite-url', normalizeUrl(m[1]));
+      frag.appendChild(span);
+      i = m.index + m[0].length;
+    }
+    const after = s.slice(i);
+    if(after) frag.appendChild(document.createTextNode(after));
+    t.parentNode.replaceChild(frag, t);
+  }
+}
+
+/* --- Finalize: assign numbers left→right, dedupe identical URLs, and render chips --- */
+function finalizeCitations(root){
+  const map = new Map(); // url -> number
+  let n = 0;
+
+  // Replace placeholders with chips, numbering deterministically
+  const placeholders = root.querySelectorAll('span[data-cite-url]');
+  placeholders.forEach(ph=>{
+    const url = normalizeUrl(ph.getAttribute('data-cite-url')||'');
+    if(!url) { ph.remove(); return; }
+    if(!map.has(url)) map.set(url, ++n);
+    const chip = makeCiteChip(map.get(url), url);
+    ph.replaceWith(chip);
+  });
+
+  // If there are any pre‑existing cite‑link anchors, renumber them too
+  root.querySelectorAll('a.cite-link').forEach(a=>{
+    const url = normalizeUrl(a.getAttribute('href')||'');
+    if(!url) return;
+    if(!map.has(url)) map.set(url, ++n);
+    a.textContent = `[${map.get(url)}]`;
+    a.setAttribute('data-bs-title', url);
+  });
+}
+
+/* --- High‑level prettifier: turns any markers / raw links into [1] chips --- */
+function prettifyCitations(el){
+  const known = collectKnownSources(el);
+  convertBracketCitations(el, known);
+  collapseInlineLinksToPlaceholders(el);
+  finalizeCitations(el);
+}
+
+/* --- Robust decoder for Jinja |tojson payloads to avoid empty bubbles --- */
 function decodeRaw(raw){
   if(raw==null) return '';
-  // If Jinja placed a JSON string into data-raw, parse it to a real string
+  const s = String(raw).trim();
   try{
-    const first = String(raw).trim()[0];
-    if(first === '"' || first === '{' || first === '['){
-      const parsed = JSON.parse(raw);
+    // If it's a JSON‑encoded string, parse it to a real string
+    const first = s[0];
+    if(first === '"' || first === "'" || first === '{' || first === '['){
+      const parsed = JSON.parse(s);
       if(typeof parsed === 'string') return parsed;
     }
-  }catch{}
+  }catch{/* fall through */}
   // Fallback: convert escaped newlines to actual newlines
-  return String(raw).replace(/\\n/g,'\n');
+  return s.replace(/\\n/g,'\n');
 }
+
+/* --- Render markdown, sanitize, then prettify citations and enable tooltips --- */
 function renderMarkdown(el){
   const rawAttr = (el.dataset && 'raw' in el.dataset) ? el.dataset.raw : el.innerText;
-  const raw = decodeRaw(rawAttr);
-  const html = marked.parse(raw || '');
-  el.innerHTML = DOMPurify.sanitize(html, sanitizeCfg);
+  const text = decodeRaw(rawAttr);
+  // 1) markdown -> HTML
+  const html = marked.parse(text || '');
+  // 2) sanitize
+  el.innerHTML = DOMPurify.sanitize(html, {ADD_ATTR:['data-bs-toggle','data-bs-title','target','rel']});
+  // 3) prettify citations (chips)
   prettifyCitations(el);
+  // 4) tooltips
   initTooltips(el);
-  // If still empty, show a thin space to keep bubble height sensible
+  // 5) fallback visual height
   if(!el.innerHTML.trim()) el.innerHTML = '&ThinSpace;';
 }
-function renderAll(){
-  document.querySelectorAll('.render-md').forEach(renderMarkdown);
-  chatBox.scrollTop = chatBox.scrollHeight;
+
+/* -------------------------- UI helpers -------------------------- */
+let latestToolUrl = '';
+let lastSearchResults = {{ (last_web_results or []) | tojson }};
+
+function initTooltips(root){
+  const els = root.querySelectorAll('[data-bs-toggle="tooltip"]');
+  els.forEach(el=> new bootstrap.Tooltip(el));
 }
+
+/* -------------------------- Chat handling -------------------------- */
+const chatBox = document.getElementById('chat');
+const chatList = document.getElementById('chat-list');
+const currentTitleEl = document.getElementById('current-chat-title');
+
 function appendMessage(role, raw, banner=null){
   const div = document.createElement('div');
   const roleCls = role==='user'?'msg-user':role==='assistant'?'msg-assistant':'msg-tool';
@@ -1061,6 +1180,7 @@ function appendMessage(role, raw, banner=null){
   chatBox.appendChild(div);
   chatBox.scrollTop = chatBox.scrollHeight;
 
+  // Remember the last tool URL for citation fallback
   if(role==='tool'){
     try{
       const data = JSON.parse(raw);
@@ -1071,7 +1191,7 @@ function appendMessage(role, raw, banner=null){
   }
 }
 
-/* ---------- UI interactions ---------- */
+/* -------------------------- Input handling -------------------------- */
 const userInput = document.getElementById('user-input');
 userInput.addEventListener('keydown', e=>{
   if(e.key==='Enter' && !e.shiftKey){
@@ -1118,6 +1238,7 @@ document.getElementById('upload-form').addEventListener('submit', async e=>{
   if(!data.success) alert('Upload failed: '+data.error);
 });
 
+/* -------------------------- Sidebar handling -------------------------- */
 async function updateSidebar(){
   const r = await fetch('/chats');
   const data = await r.json();
@@ -1172,6 +1293,11 @@ document.getElementById('clear-chat').addEventListener('click', async ()=>{
 });
 renderAll();
 updateSidebar();
+
+function renderAll(){
+  document.querySelectorAll('.render-md').forEach(renderMarkdown);
+  chatBox.scrollTop = chatBox.scrollHeight;
+}
 </script>
 </body>
 </html>

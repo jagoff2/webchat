@@ -513,7 +513,7 @@ Do not include chain‑of‑thought.
 # ----------------------------------------------------------------------
 WINDOW_USER_TURNS = 6      # last N user+assistant messages
 WINDOW_TOOL_PAIRS = 6      # last N tool call/result pairs
-MAX_TOOL_STEPS = 64        # safety guard
+MAX_TOOL_STEPS = 640        # safety guard
 
 def _build_windowed_messages(full: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Trim the full history to a manageable window."""
@@ -566,10 +566,10 @@ def _call_llama(messages: List[Dict[str, Any]], *, tools: Optional[List[Dict[str
                 tool_choice: str = "auto") -> Dict[str, Any]:
     """Send a request to the local LLaMA server."""
     payload: Dict[str, Any] = {
-        "model": "local-llama",
+        "model": "model1",
         "messages": messages,
         "temperature": 1.0,
-        "max_tokens": 64000,
+        "max_tokens": 60000,
         "stream": False,
     }
     if tools:
@@ -577,7 +577,7 @@ def _call_llama(messages: List[Dict[str, Any]], *, tools: Optional[List[Dict[str
         payload["tool_choice"] = tool_choice
 
     app.logger.debug("→ LLaMA payload: %s", json.dumps(payload, ensure_ascii=False)[:800])
-    resp = _http.post(Config.LLAMA_ENDPOINT, json=payload, timeout=30000)
+    resp = _http.post(Config.LLAMA_ENDPOINT, json=payload, timeout=300000)
     resp.raise_for_status()
     result = resp.json()
     app.logger.debug("← LLaMA response: %s", json.dumps(result, ensure_ascii=False)[:800])
